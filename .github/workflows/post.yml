@@ -1,0 +1,34 @@
+name: SNS投稿
+
+on:
+  # 毎時5分に、承認済みの投稿がないか見にいく
+  schedule:
+    - cron: "5 * * * *"
+
+  # 手で実行するとき用。最初の確認はこちらから
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "送らずに内容だけ表示する"
+        type: boolean
+        default: true
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 承認済みの投稿を送る
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          # 手動実行のときだけ dry_run を見る。定期実行では常に本番
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+        run: python post.py
