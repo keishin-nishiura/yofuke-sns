@@ -4,10 +4,14 @@
 
 流れ:
     Notion の「ステータス = 承認済み」の行を拾う
+      → 空いている枠（朝・夜）を割り当てて「予定日」に書く
       → ステータスを「投稿処理中」にして確保する（二重処理の防止）
       → Buffer の createPost で X と Threads に送る
       → 成功した側の BufferID を書き戻す
       → 両方成功したら「投稿済み」、片方でも落ちたら「投稿エラー」
+
+枠はここで決める。まとめて承認しても、1日2本ずつに配られる。
+すでに「予定日」が未来で入っている行は、その時刻を尊重する（手動の指定）。
 
 環境変数:
     NOTION_TOKEN      Notion のインテグレーションのトークン（必須）
@@ -17,6 +21,8 @@
 
 import json
 import os
+import random
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -44,6 +50,20 @@ P_ERROR = "エラー"
 P_BUFFER_ID = {"X": "BufferID_X", "Threads": "BufferID_Threads"}
 
 JST = timezone(timedelta(hours=9))
+
+# 1日2本。朝と夜に1本ずつ。分はこの幅の中から毎回ランダムに選ぶ。
+SLOTS = (
+    ("朝", 7, 20, 8, 50),
+    ("夜", 21, 40, 23, 20),
+)
+
+# Buffer の無料プランは予約を1チャンネル10件までしか持てない。
+# 余裕を見て、ここまでしか先に入れない。溢れたぶんは次の実行に回る。
+MAX_QUEUED = 8
+
+# 直前すぎる枠は使わない（Buffer に入れる前に過ぎてしまうため）
+MIN_LEAD = timedelta(minutes=20)
+
 DRY_RUN = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "True")
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
@@ -71,12 +91,12 @@ def notion(path, payload=None, method="POST"):
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
     }
-    if method == "PATCH":
+    if method in ("PATCH", "GET"):
         req = urllib.request.Request(
             url,
-            data=json.dumps(payload).encode("utf-8"),
+            data=(json.dumps(payload).encode("utf-8") if method == "PATCH" else None),
             headers=headers,
-            method="PATCH",
+            method=method,
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as res:
@@ -126,15 +146,52 @@ def date_start(prop):
     return d["start"] if d else None
 
 
+def parse_dt(value):
+    """Notion の日付文字列を JST つきの datetime にする。"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=JST) if dt.tzinfo is None else dt
+
+
 def fetch_approved():
+    """承認済みの行を、古い順に。"""
     res = notion(
         f"databases/{NOTION_DB}/query",
         {
             "filter": {"property": P_STATUS, "select": {"equals": "承認済み"}},
+            "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
             "page_size": 25,
         },
     )
     return res.get("results", [])
+
+
+def fetch_scheduled():
+    """すでに Buffer に入っている、これからの投稿。枠の重複を避けるために使う。"""
+    now = datetime.now(JST)
+    res = notion(
+        f"databases/{NOTION_DB}/query",
+        {
+            "filter": {
+                "and": [
+                    {"property": P_SCHEDULED, "date": {"on_or_after": now.date().isoformat()}},
+                    {"or": [{"property": P_STATUS, "select": {"equals": s}}
+                            for s in ("投稿済み", "投稿処理中")]},
+                ]
+            },
+            "page_size": 100,
+        },
+    )
+    out = []
+    for page in res.get("results", []):
+        dt = parse_dt(date_start(page["properties"].get(P_SCHEDULED)))
+        if dt and dt > now:
+            out.append(dt)
+    return out
 
 
 def update_page(page_id, props):
@@ -149,6 +206,46 @@ def set_status(page_id, status, **extra):
 
 def rich(text):
     return {"rich_text": [{"text": {"content": text[:2000]}}]}
+
+
+def date_prop(dt):
+    return {"date": {"start": dt.isoformat()}}
+
+
+# ---------------------------------------------------------------- 枠の割り当て
+
+def slot_key(dt):
+    """その時刻がどの日のどの枠かを表す目印。"""
+    for name, h1, m1, h2, m2 in SLOTS:
+        start = dt.replace(hour=h1, minute=m1, second=0, microsecond=0)
+        end = dt.replace(hour=h2, minute=m2, second=0, microsecond=0)
+        if start <= dt <= end:
+            return (dt.date(), name)
+    return (dt.date(), "他")
+
+
+def next_slots(count, taken, now=None):
+    """空いている枠を、近い順に count 個返す。分はランダム。"""
+    now = now or datetime.now(JST)
+    busy = {slot_key(dt) for dt in taken}
+    out = []
+    day = now.date()
+    for offset in range(0, 60):
+        d = day + timedelta(days=offset)
+        for name, h1, m1, h2, m2 in SLOTS:
+            if len(out) >= count:
+                return out
+            if (d, name) in busy:
+                continue
+            start = datetime.combine(d, datetime.min.time(), JST).replace(hour=h1, minute=m1)
+            end = datetime.combine(d, datetime.min.time(), JST).replace(hour=h2, minute=m2)
+            span = int((end - start).total_seconds() // 60)
+            when = start + timedelta(minutes=random.randint(0, span))
+            if when <= now + MIN_LEAD:
+                continue
+            out.append(when)
+            busy.add((d, name))
+    return out
 
 
 # ---------------------------------------------------------------- Buffer 投稿
@@ -178,7 +275,7 @@ def create_post(channel_id, text, image_url=None, due_at=None):
 
     if due_at:
         post_input["mode"] = "customScheduled"
-        post_input["dueAt"] = due_at
+        post_input["dueAt"] = due_at.isoformat()
     else:
         post_input["mode"] = "shareNow"
 
@@ -198,7 +295,22 @@ def create_post(channel_id, text, image_url=None, due_at=None):
     return typename
 
 
-# ---------------------------------------------------------------- 本体
+# ---------------------------------------------------------------- 本文
+
+# Xの数え方。日本語などは1字2カウント、ASCII相当は1、URLは長さに関係なく23。
+# 上限280。Bufferに断られる前にこちらで止める。
+X_LIMIT = 280
+URL_RE = re.compile(r"https?://\S+")
+LIGHT_RANGES = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+
+
+def x_weight(text):
+    total = 23 * len(URL_RE.findall(text))
+    for ch in URL_RE.sub("", text):
+        cp = ord(ch)
+        total += 1 if any(a <= cp <= b for a, b in LIGHT_RANGES) else 2
+    return total
+
 
 def build_text(props):
     """本文を組み立てる。記事告知の回だけ末尾にリンクを付ける。"""
@@ -218,26 +330,20 @@ def build_text(props):
             )
         text = f"{text}\n\n{link}"
 
+    weight = x_weight(text)
+    if weight > X_LIMIT:
+        over = weight - X_LIMIT
+        raise RuntimeError(
+            f"Xの上限を超えています（{weight}/{X_LIMIT}カウント、{over}超過）。"
+            f"日本語でおよそ{(over + 1) // 2}字ぶん削ってください"
+        )
+
     return text
 
 
-def due_at_or_none(props):
-    """予定日が未来なら ISO 文字列で返す。過去・未設定なら None（即時投稿）。"""
-    start = date_start(props.get(P_SCHEDULED))
-    if not start:
-        return None
-    try:
-        when = datetime.fromisoformat(start)
-    except ValueError:
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=JST)
-    if when <= datetime.now(timezone.utc) + timedelta(minutes=5):
-        return None
-    return when.isoformat()
+# ---------------------------------------------------------------- 本体
 
-
-def handle(page):
+def handle(page, due_at):
     page_id = page["id"]
     props = page["properties"]
     title = plain(props.get(P_TITLE)) or page_id
@@ -252,10 +358,10 @@ def handle(page):
         return False
 
     image_url = url_value(props.get(P_IMAGE)) or None
-    due_at = due_at_or_none(props)
 
-    print(f"  {len(text)}字 / 画像: {'あり' if image_url else 'なし'} / "
-          f"{'予約 ' + due_at if due_at else '即時'}")
+    when = due_at.strftime("%-m/%-d %H:%M") if due_at else "即時"
+    print(f"  {len(text)}字（{x_weight(text)}/{X_LIMIT}カウント） / "
+          f"画像: {'あり' if image_url else 'なし'} / {when}")
 
     # すでに送れている側は飛ばす（途中で落ちたときの再実行に耐える）
     done = {}
@@ -267,13 +373,15 @@ def handle(page):
 
     if len(done) == len(CHANNELS):
         set_status(page_id, "投稿済み",
-                   **{P_POSTED_AT: {"date": {"start": datetime.now(JST).isoformat()}}})
+                   **{P_POSTED_AT: date_prop(datetime.now(JST))})
         print("  ✓ すでに両方送信済みでした。投稿済みにしました")
         return True
 
-    # 処理中として確保する。ここで落ちても、次回は「承認済み」を拾わない。
+    # 処理中として確保し、割り当てた枠を予定日に書く。
+    # ここで落ちても、次回は「承認済み」を拾わないし、枠も残る。
     if not DRY_RUN:
-        set_status(page_id, "投稿処理中")
+        extra = {P_SCHEDULED: date_prop(due_at)} if due_at else {}
+        set_status(page_id, "投稿処理中", **extra)
 
     errors = []
     for label, channel_id in CHANNELS.items():
@@ -299,10 +407,7 @@ def handle(page):
 
     set_status(
         page_id, "投稿済み",
-        **{
-            P_POSTED_AT: {"date": {"start": datetime.now(JST).isoformat()}},
-            P_ERROR: rich(""),
-        },
+        **{P_POSTED_AT: date_prop(datetime.now(JST)), P_ERROR: rich("")},
     )
     return True
 
@@ -321,12 +426,36 @@ def main():
         print("承認済みの投稿はありません。")
         return
 
-    print(f"承認済み {len(pages)} 件")
+    scheduled = fetch_scheduled()
+    room = MAX_QUEUED - len(scheduled)
+    print(f"承認済み {len(pages)} 件 / 予約済み {len(scheduled)} 件 / 今回入れられる {max(room, 0)} 件")
+
+    if room <= 0:
+        print(f"予約が上限（{MAX_QUEUED}件）に達しています。次の実行に回します。")
+        return
+
+    now = datetime.now(JST)
+    todo = []
+    need_slot = []
+
+    # すでに未来の予定日が入っている行は、その指定を使う（手動の上書き）
+    for page in pages[:room]:
+        fixed = parse_dt(date_start(page["properties"].get(P_SCHEDULED)))
+        if fixed and fixed > now + MIN_LEAD:
+            todo.append((page, fixed))
+            scheduled.append(fixed)
+        else:
+            need_slot.append(page)
+
+    for page, when in zip(need_slot, next_slots(len(need_slot), scheduled, now)):
+        todo.append((page, when))
+
+    todo.sort(key=lambda t: t[1])
 
     failed = 0
-    for page in pages:
+    for page, when in todo:
         try:
-            if not handle(page):
+            if not handle(page, when):
                 failed += 1
         except Exception as e:
             failed += 1
@@ -336,7 +465,8 @@ def main():
             except Exception:
                 pass
 
-    print(f"\n完了。失敗 {failed} 件")
+    left = len(pages) - len(todo)
+    print(f"\n完了。失敗 {failed} 件" + (f" / 順番待ち {left} 件" if left > 0 else ""))
     if failed:
         sys.exit(1)
 
